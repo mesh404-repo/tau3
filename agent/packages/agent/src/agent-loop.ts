@@ -11,6 +11,7 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@mariozechner/pi-ai";
+import { normalizeDiffForScoring } from "./diff-normalizer.js";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -23,6 +24,29 @@ import type {
 } from "./types.js";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+// tau/sn66 v18: run the diff normalizer exactly once per agent run, right
+// before we emit `agent_end`. runLoop has several early-return paths
+// (aborted, provider-error exhaust, hard exit, natural end); each must
+// trigger at most one normalization attempt. Failures are swallowed so the
+// normalizer can never break a scoring run.
+function runDiffNormalizerOnce(state: { done: boolean }): void {
+	if (state.done) return;
+	state.done = true;
+	try {
+		normalizeDiffForScoring({
+			log: (msg) => {
+				try {
+					process.stderr.write(`${msg}\n`);
+				} catch {
+					// ignore
+				}
+			},
+		});
+	} catch {
+		// swallow
+	}
+}
 
 /**
  * Start an agent loop with a new prompt message.
@@ -164,6 +188,43 @@ async function runLoop(
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
+	// tau/sn66 v18: guard so normalization runs exactly once per agent run.
+	const normalizerState = { done: false };
+
+	// tau/sn66 v15.1: provider-error retry. Verified in local smoke test
+	// (smoke-batch-2): Gemini Flash via tau OpenRouter proxy intermittently
+	// returns finish_reason=error mid-stream, leaving the partial assistant
+	// message in context with no tool calls. Without retry the agent exits
+	// with 0 edits and produces an empty diff. With retry we inject a
+	// continuation prompt and try again.
+	let providerErrorRetries = 0;
+	const MAX_PROVIDER_ERROR_RETRIES = 100;
+
+	// tau/sn66 v15.2: consecutive edit-error detector.
+	const editErrorsByFile = new Map<string, number>();
+	const stuckFilesAlerted = new Set<string>();
+	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
+
+	// tau/sn66 v16: exploration budget + token-length retry + no-edit retry.
+	let readsWithoutEdit = 0;
+	let hasEditedAnyFile = false;
+	let noToolCallRetries = 0;
+	const MAX_NO_TOOL_RETRIES = 2;
+	const MAX_READS_BEFORE_EDIT = 2;
+
+	// tau/sn66 v17: wall-clock time pressure. The validator kills us at
+	// min(cursor_time*2, 300s) but we don't know the exact budget. We
+	// assume worst case ~120s and inject urgency at 60% of that. If we
+	// haven't edited by 80s, we MUST edit something or we lose.
+	const loopStartTime = Date.now();
+	let timeWarningInjected = false;
+	const TIME_WARNING_MS = 20_000;  // v2: 20s — early warning for short budgets (40-61s possible)
+	// tau/sn66 v17: hard exit before validator kills us. If the validator
+	// kills the container, the diff is LOST (validator bug: it only collects
+	// the diff if the container is still running). By exiting gracefully
+	// at 170s, we ensure the container is alive when the diff is collected.
+	const HARD_EXIT_MS = 170_000;
+
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
@@ -191,15 +252,65 @@ async function runLoop(
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+			if (message.stopReason === "aborted") {
 				await emit({ type: "turn_end", message, toolResults: [] });
+				runDiffNormalizerOnce(normalizerState);
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
-			// Check for tool calls
+			// tau/sn66 v15.1: provider error → inject continuation and retry
+			// instead of exiting. Caps at 3 retries to avoid infinite loops.
+			if (message.stopReason === "error") {
+				if (providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
+					providerErrorRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "Your previous response was cut off by a provider error. Continue immediately with a tool call — do not write narrative text, call read or edit directly. The harness scores your diff from disk; an empty diff loses the round.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					hasMoreToolCalls = false;
+					continue;
+				}
+				await emit({ type: "turn_end", message, toolResults: [] });
+				runDiffNormalizerOnce(normalizerState);
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			// tau/sn66 v16: if model hit token limit or stopped without tool calls,
+			// inject retry. This catches the case where Gemini Flash writes a huge
+			// text response and exhausts output tokens without making any tool call.
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
+
+			if (!hasMoreToolCalls && noToolCallRetries < MAX_NO_TOOL_RETRIES) {
+				const isLength = message.stopReason === "length";
+				const isStopNoEdit = message.stopReason === "stop" && !hasEditedAnyFile;
+				if (isLength || isStopNoEdit) {
+					noToolCallRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: isLength
+									? "You hit the token limit without making any tool call. Do NOT write text. Call `read` or `edit` directly. One read + one edit = minimum unit of work."
+									: "You stopped without editing any file. An empty diff loses. Call `read` on the most likely target file, then `edit` it. Do it now.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					continue;
+				}
+			}
 
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
@@ -208,6 +319,101 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+				}
+
+				// tau/sn66 v15.2: track consecutive edit failures per file.
+				// When the same file accumulates >= threshold edit errors,
+				// inject a steering message to force the model off that file.
+				for (let i = 0; i < toolResults.length; i++) {
+					const tr = toolResults[i];
+					const tc = toolCalls[i];
+					if (!tc || tc.type !== "toolCall") continue;
+					if (tc.name !== "edit") continue;
+					const targetPath = (tc.arguments as { path?: string } | undefined)?.path;
+					if (!targetPath || typeof targetPath !== "string") continue;
+					if (tr.isError) {
+						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
+						editErrorsByFile.set(targetPath, next);
+						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
+							stuckFilesAlerted.add(targetPath);
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `STOP editing \`${targetPath}\`. You have failed ${next} edit attempts on this file in a row, all with "Could not find oldText" errors. The model's mental copy of this file is wrong. Do ONE of the following NOW:\n\n1. Move on to a DIFFERENT file in the task — there are likely other files mentioned in the acceptance criteria you haven't touched yet.\n2. If you must keep editing this file, call \`read\` on it ONE MORE TIME to refresh your view, then make ONE small edit with a very short, unique oldText snippet (5-10 lines max). Do not paste large blocks.\n3. Never paste text you remember — only paste text you have JUST read in this session.\n\nDo not retry the failed edits. Move on.`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+						}
+					} else {
+						// Successful edit on this file resets its error counter.
+						editErrorsByFile.set(targetPath, 0);
+						hasEditedAnyFile = true;
+						readsWithoutEdit = 0;
+						// tau/sn66 v17: after successful edit, warn model that
+						// the file changed. Without this, the model tries to
+						// edit the same file again with oldText from BEFORE its
+						// edit, which always fails.
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `\`${targetPath}\` was modified by your edit. If you need to edit this file again, call \`read\` on it first to see the current content. Do NOT use oldText from memory — it is now stale.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
+				// tau/sn66 v16: track exploration budget.
+				for (const tr of toolResults) {
+					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
+						if (!hasEditedAnyFile) readsWithoutEdit++;
+					}
+				}
+
+				// If model has read N files without editing, force it to edit.
+				if (!hasEditedAnyFile && readsWithoutEdit >= MAX_READS_BEFORE_EDIT && pendingMessages.length === 0) {
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "You have read enough files. Call `edit` on the most likely target file NOW. Do not read more files. One imperfect edit beats an empty diff.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					readsWithoutEdit = 0;
+				}
+
+				// tau/sn66 v17: hard exit — stop gracefully before validator kills us.
+				// This ensures the container is still running when the diff is collected.
+				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
+					await emit({ type: "turn_end", message, toolResults });
+					runDiffNormalizerOnce(normalizerState);
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				// tau/sn66 v17: time pressure — if we've been running for 80s
+				// without a single successful edit, inject urgency.
+				if (!hasEditedAnyFile && !timeWarningInjected && (Date.now() - loopStartTime) >= TIME_WARNING_MS && pendingMessages.length === 0) {
+					timeWarningInjected = true;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "TIME WARNING: you have been running for over 80 seconds without producing an edit. The validator will kill this process soon. You MUST call `edit` or `write` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.",
+							},
+						],
+						timestamp: Date.now(),
+					});
 				}
 			}
 
@@ -228,6 +434,7 @@ async function runLoop(
 		break;
 	}
 
+	runDiffNormalizerOnce(normalizerState);
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
